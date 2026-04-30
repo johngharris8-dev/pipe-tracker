@@ -1608,6 +1608,38 @@ function AlertsModal({pipes,triggerRules,onClose,onSelect}){
 }
 
 // -- localStorage helpers -----------------------------------------------------
+// -- Supabase config (edit these two lines) -----------------------------------
+const SUPABASE_URL="https://skfmtshibkfpwgwxscql.supabase.co";
+const SUPABASE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrZm10c2hpYmtmcHdnd3hzY3FsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc0NDQ2OTIsImV4cCI6MjA5MzAyMDY5Mn0.uK3b45fOqPnICRTSaT8alkmmCn72qDsaUTy9z0MxA4Y";
+// Lightweight Supabase REST client - no npm package needed
+const sb={
+  _h:{"apikey":SUPABASE_KEY,"Authorization":"Bearer "+SUPABASE_KEY,"Content-Type":"application/json"},
+  from(table){
+    const base=SUPABASE_URL+"/rest/v1/"+table;
+    const h=this._h;
+    return{
+      async upsert(data){
+        try{
+          const r=await fetch(base,{method:"POST",headers:{...h,"Prefer":"resolution=merge-duplicates"},body:JSON.stringify(data)});
+          return{error:r.ok?null:await r.text()};
+        }catch(e){return{error:e.message};}
+      },
+      async selectAll(){
+        try{
+          const r=await fetch(base+"?select=*",{headers:h});
+          return r.ok?{data:await r.json(),error:null}:{data:null,error:await r.text()};
+        }catch(e){return{data:null,error:e.message};}
+      },
+      async delete(id){
+        try{
+          const r=await fetch(base+"?id=eq."+encodeURIComponent(id),{method:"DELETE",headers:h});
+          return{error:r.ok?null:await r.text()};
+        }catch(e){return{error:e.message};}
+      }
+    };
+  }
+};
+
 const STORAGE_KEYS={pipes:"pwt_pipes",areas:"pwt_areas",rules:"pwt_rules"};
 function loadFromStorage(key,fallback){
   try{
@@ -1621,6 +1653,26 @@ function saveToStorage(key,value){
   catch(e){console.warn("localStorage save failed:",e);}
 }
 
+// -- Sync indicator -----------------------------------------------------------
+function SyncIndicator(){
+  const[online,setOnline]=React.useState(navigator.onLine);
+  React.useEffect(()=>{
+    const on=()=>setOnline(true);
+    const off=()=>setOnline(false);
+    window.addEventListener("online",on);
+    window.addEventListener("offline",off);
+    return()=>{window.removeEventListener("online",on);window.removeEventListener("offline",off);};
+  },[]);
+  return(
+    <div style={{background:"#0d1520",borderBottom:"1px solid #1e2d3d",padding:"3px 16px",display:"flex",alignItems:"center",gap:6}}>
+      <div style={{width:6,height:6,borderRadius:"50%",background:online?C.ok:C.warn,boxShadow:online?"0 0 4px "+C.ok:"none"}}/>
+      <span style={{fontSize:9,color:online?C.ok:C.warn,fontFamily:F.mono,letterSpacing:0.5}}>
+        {online?"ONLINE - data syncing to cloud":"OFFLINE - changes saved locally, will sync when online"}
+      </span>
+    </div>
+  );
+}
+
 // -- App Root -----------------------------------------------------------------
 export default function App(){
   const[pipes,setPipesRaw]=useState(()=>loadFromStorage(STORAGE_KEYS.pipes,sampleData));
@@ -1630,8 +1682,33 @@ export default function App(){
   ]));
 
   // Wrap setters to auto-save to localStorage on every change
-  function setPipes(val){const next=typeof val==="function"?val(pipes):val;saveToStorage(STORAGE_KEYS.pipes,next);setPipesRaw(next);}
+  function setPipes(val){
+    const next=typeof val==="function"?val(pipes):val;
+    saveToStorage(STORAGE_KEYS.pipes,next);setPipesRaw(next);
+    if(navigator.onLine)next.forEach(p=>{sb.from("pipes").upsert({id:String(p.id),data:p,updated_at:new Date().toISOString()});});
+  }
   function setCustomAreas(val){const next=typeof val==="function"?val(customAreas):val;saveToStorage(STORAGE_KEYS.areas,next);setCustomAreasRaw(next);}
+
+  // On load: pull latest pipes from Supabase and merge with local data
+  useEffect(()=>{
+    if(!navigator.onLine)return;
+    sb.from("pipes").selectAll().then(({data,error})=>{
+      if(error||!data||!data.length)return;
+      const remote=data.filter(r=>r.data&&r.data.id).map(r=>({...r.data,_syncedAt:r.updated_at}));
+      if(!remote.length)return;
+      // Merge: keep local version if newer, remote if newer
+      const localMap=Object.fromEntries((loadFromStorage(STORAGE_KEYS.pipes,[])).map(p=>[String(p.id),p]));
+      remote.forEach(rp=>{
+        const lp=localMap[String(rp.id)];
+        const rts=new Date(rp._syncedAt||0).getTime();
+        const lts=lp?new Date(lp._syncedAt||0).getTime():0;
+        if(!lp||rts>lts)localMap[String(rp.id)]=rp;
+      });
+      const merged=Object.values(localMap);
+      saveToStorage(STORAGE_KEYS.pipes,merged);
+      setPipesRaw(merged);
+    });
+  },[]);
   function setTriggerRules(val){const next=typeof val==="function"?val(triggerRules):val;saveToStorage(STORAGE_KEYS.rules,next);setTriggerRulesRaw(next);}
   const[selected,setSelected]=useState(null);
   const[editPipe,setEditPipe]=useState(null);
@@ -1664,7 +1741,12 @@ export default function App(){
     ok:pipes.filter(p=>getStatus(p.nominalThickness,p.spots)==="ok").length,
   };
   function save(updated){setPipes(pipes.map(p=>p.id===updated.id?updated:p));setSelected(null);}
-  function del(id){setPipes(pipes.filter(p=>p.id!==id));if(selected?.id===id)setSelected(null);}
+  function del(id){
+    const next=pipes.filter(p=>p.id!==id);
+    saveToStorage(STORAGE_KEYS.pipes,next);setPipesRaw(next);
+    sb.from("pipes").delete(String(id));
+    if(selected?.id===id)setSelected(null);
+  }
   function delArea(name){setPipes(pipes.map(p=>p.area===name?{...p,area:""}:p));setCustomAreas(customAreas.filter(a=>a!==name));if(areaFilter===name)setAreaFilter("all");}
   function handleExport(){exportToCSV(pipes);}
   function handleImport(e){
@@ -1680,6 +1762,7 @@ export default function App(){
   return(
     <div style={{background:C.bg,minHeight:"100vh",color:C.text,fontFamily:F.sans,maxWidth:480,margin:"0 auto",position:"relative"}}>
       <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;700;800&family=DM+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+      <SyncIndicator/>
       {/* Header */}
       <div style={{padding:"48px 20px 16px",background:`linear-gradient(180deg,${C.surface},${C.bg})`,borderBottom:`1px solid ${C.border}`}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
